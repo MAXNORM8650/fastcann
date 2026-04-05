@@ -1,8 +1,79 @@
 from pathlib import Path
+import os
+import shutil
+import subprocess
+import tempfile
 
 from setuptools import find_packages, setup
 
 README = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+
+ROCM_ARCH_ENV_VARS = (
+    "PYTORCH_ROCM_ARCH",
+    "HCC_AMDGPU_TARGET",
+    "AMDGPU_TARGETS",
+)
+
+
+def _split_rocm_arches(value):
+    return [arch for arch in value.replace(",", ";").split(";") if arch]
+
+
+def _hipcc_path():
+    return shutil.which("hipcc") or "/opt/rocm/bin/hipcc"
+
+
+def _hipcc_supports_arch(arch):
+    hipcc = _hipcc_path()
+    if not Path(hipcc).exists():
+        return True
+
+    src = "__global__ void fastcann_probe() {}\n"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_path = Path(tmpdir) / "probe.hip"
+        out_path = Path(tmpdir) / "probe.o"
+        src_path.write_text(src, encoding="utf-8")
+        cmd = [
+            hipcc,
+            "--cuda-device-only",
+            f"--offload-arch={arch}",
+            "-c",
+            str(src_path),
+            "-o",
+            str(out_path),
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    return result.returncode == 0
+
+
+def _sanitize_rocm_arch_env():
+    for env_var in ROCM_ARCH_ENV_VARS:
+        raw_value = os.environ.get(env_var)
+        if not raw_value:
+            continue
+
+        requested_arches = _split_rocm_arches(raw_value)
+        supported_arches = [arch for arch in requested_arches if _hipcc_supports_arch(arch)]
+        dropped_arches = [arch for arch in requested_arches if arch not in supported_arches]
+
+        if dropped_arches:
+            print(
+                f"fastcann: dropping unsupported ROCm archs from {env_var}: "
+                + ", ".join(dropped_arches)
+            )
+
+        if supported_arches:
+            os.environ[env_var] = ";".join(supported_arches)
+        else:
+            os.environ.pop(env_var, None)
+            print(
+                f"fastcann: removed {env_var} because none of its ROCm archs are supported by hipcc"
+            )
 
 
 def get_extension_modules():
@@ -10,6 +81,9 @@ def get_extension_modules():
     from torch.utils.cpp_extension import CUDAExtension
 
     is_rocm = getattr(torch.version, "hip", None) is not None
+
+    if is_rocm:
+        _sanitize_rocm_arch_env()
 
     cxx_flags = ["-O3", "-std=c++17"]
     device_flags = ["-O3", "-std=c++17"]
