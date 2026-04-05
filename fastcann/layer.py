@@ -8,10 +8,13 @@ from . import _C
 class CanonFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, mix: Tensor):
-        if x.dtype != torch.float32:
-            raise TypeError(f"x must be float32, got {x.dtype}")
-        if mix.dtype != torch.float32:
-            raise TypeError(f"mix must be float32, got {mix.dtype}")
+        valid_dtypes = {torch.float32, torch.float16, torch.bfloat16}
+        if x.dtype not in valid_dtypes:
+            raise TypeError(f"x must be float32, float16, or bfloat16, got {x.dtype}")
+        if mix.dtype not in valid_dtypes:
+            raise TypeError(f"mix must be float32, float16, or bfloat16, got {mix.dtype}")
+        if x.dtype != mix.dtype:
+            raise TypeError(f"x and mix must have the same dtype, got {x.dtype} and {mix.dtype}")
         x = x.contiguous()
         mix = mix.contiguous()
         y = _C.forward(x, mix)
@@ -27,7 +30,7 @@ class CanonFn(torch.autograd.Function):
 
 
 class CanonLayerCUDA(nn.Module):
-    """GPU implementation of CanonLayer for float32 CUDA/ROCm tensors."""
+    """GPU implementation of CanonLayer for float32, float16, and bfloat16 CUDA/ROCm tensors."""
 
     def __init__(self, dim: int, kernel_size: int = 4):
         super().__init__()
