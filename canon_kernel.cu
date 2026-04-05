@@ -1,7 +1,5 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <vector>
@@ -15,13 +13,21 @@
 namespace {
 
 constexpr int THREADS = 256;
-constexpr int TILE_L = 128;
-constexpr int CTILE = 2;
+constexpr int TILE_L = 64;
+constexpr int CTILE = 4;
 constexpr int REDUCE_THREADS = 256;
-constexpr int REDUCE_CTILE = 2;
+constexpr int REDUCE_CTILE = 4;
+constexpr int K2_TILE_L = 128;
+constexpr int K2_CTILE = 2;
+constexpr int K2_REDUCE_THREADS = 64;
+constexpr int K2_REDUCE_CTILE = 8;
 
-template <typename scalar_t>
-__global__ void canon_fwd_kernel_k4(
+// Canon semantics:
+// center = K / 2
+// y[t] = x[t] + sum_k mix[k] * x[t + center - k]
+
+template <int K, int TILE_L_, int CTILE_, typename scalar_t>
+__global__ void canon_fwd_smallk_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ mix,
     scalar_t* __restrict__ y,
@@ -29,20 +35,21 @@ __global__ void canon_fwd_kernel_k4(
     int L,
     int D) {
     using acc_t = float;
+    constexpr int CENTER = K / 2;
+    constexpr int LEFT = K - 1 - CENTER;
+
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-
-    const int tile_l0 = blockIdx.x * TILE_L;
-    const int c0 = blockIdx.y * CTILE;
+    const int tile_l0 = blockIdx.x * TILE_L_;
+    const int c0 = blockIdx.y * CTILE_;
     const int b = blockIdx.z;
-
     const int t = tile_l0 + tx;
     const int c = c0 + ty;
 
-    __shared__ acc_t smem[CTILE][TILE_L + 3];
+    __shared__ acc_t smem[CTILE_][TILE_L_ + K - 1];
 
-    for (int s = tx; s < TILE_L + 3; s += blockDim.x) {
-        const int g_t = tile_l0 - 1 + s;
+    for (int s = tx; s < TILE_L_ + K - 1; s += blockDim.x) {
+        const int g_t = tile_l0 - LEFT + s;
         acc_t v = 0.0f;
         if (c < D && g_t >= 0 && g_t < L) {
             v = static_cast<acc_t>(x[(b * L + g_t) * D + c]);
@@ -52,22 +59,17 @@ __global__ void canon_fwd_kernel_k4(
     __syncthreads();
 
     if (t < L && c < D) {
-        const acc_t w0 = static_cast<acc_t>(mix[0 * D + c]);
-        const acc_t w1 = static_cast<acc_t>(mix[1 * D + c]);
-        const acc_t w2 = static_cast<acc_t>(mix[2 * D + c]);
-        const acc_t w3 = static_cast<acc_t>(mix[3 * D + c]);
-
-        const acc_t xm1 = smem[ty][tx + 0];
-        const acc_t x0 = smem[ty][tx + 1];
-        const acc_t xp1 = smem[ty][tx + 2];
-        const acc_t xp2 = smem[ty][tx + 3];
-
-        y[(b * L + t) * D + c] = static_cast<scalar_t>(x0 + w0 * xp2 + w1 * xp1 + w2 * x0 + w3 * xm1);
+        acc_t acc = smem[ty][tx + LEFT];
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            acc += static_cast<acc_t>(mix[k * D + c]) * smem[ty][tx + (K - 1 - k)];
+        }
+        y[(b * L + t) * D + c] = static_cast<scalar_t>(acc);
     }
 }
 
-template <typename scalar_t>
-__global__ void canon_bwd_dx_kernel_k4(
+template <int K, int TILE_L_, int CTILE_, typename scalar_t>
+__global__ void canon_bwd_dx_smallk_kernel(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ mix,
     scalar_t* __restrict__ grad_x,
@@ -75,20 +77,20 @@ __global__ void canon_bwd_dx_kernel_k4(
     int L,
     int D) {
     using acc_t = float;
+    constexpr int CENTER = K / 2;
+
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-
-    const int tile_l0 = blockIdx.x * TILE_L;
-    const int c0 = blockIdx.y * CTILE;
+    const int tile_l0 = blockIdx.x * TILE_L_;
+    const int c0 = blockIdx.y * CTILE_;
     const int b = blockIdx.z;
-
     const int t = tile_l0 + tx;
     const int c = c0 + ty;
 
-    __shared__ acc_t smem[CTILE][TILE_L + 3];
+    __shared__ acc_t smem[CTILE_][TILE_L_ + K - 1];
 
-    for (int s = tx; s < TILE_L + 3; s += blockDim.x) {
-        const int g_t = tile_l0 - 2 + s;
+    for (int s = tx; s < TILE_L_ + K - 1; s += blockDim.x) {
+        const int g_t = tile_l0 - CENTER + s;
         acc_t v = 0.0f;
         if (c < D && g_t >= 0 && g_t < L) {
             v = static_cast<acc_t>(grad_out[(b * L + g_t) * D + c]);
@@ -98,22 +100,17 @@ __global__ void canon_bwd_dx_kernel_k4(
     __syncthreads();
 
     if (t < L && c < D) {
-        const acc_t w0 = static_cast<acc_t>(mix[0 * D + c]);
-        const acc_t w1 = static_cast<acc_t>(mix[1 * D + c]);
-        const acc_t w2 = static_cast<acc_t>(mix[2 * D + c]);
-        const acc_t w3 = static_cast<acc_t>(mix[3 * D + c]);
-
-        const acc_t gm2 = smem[ty][tx + 0];
-        const acc_t gm1 = smem[ty][tx + 1];
-        const acc_t g0 = smem[ty][tx + 2];
-        const acc_t gp1 = smem[ty][tx + 3];
-
-        grad_x[(b * L + t) * D + c] = static_cast<scalar_t>(g0 + w0 * gm2 + w1 * gm1 + w2 * g0 + w3 * gp1);
+        acc_t acc = smem[ty][tx + CENTER];
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            acc += static_cast<acc_t>(mix[k * D + c]) * smem[ty][tx + k];
+        }
+        grad_x[(b * L + t) * D + c] = static_cast<scalar_t>(acc);
     }
 }
 
-template <typename scalar_t>
-__global__ void canon_bwd_dmix_kernel_k4(
+template <int K, int REDUCE_THREADS_, int REDUCE_CTILE_, typename scalar_t>
+__global__ void canon_bwd_dmix_smallk_kernel(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x,
     scalar_t* __restrict__ grad_mix,
@@ -121,24 +118,23 @@ __global__ void canon_bwd_dmix_kernel_k4(
     int L,
     int D) {
     using acc_t = float;
+    constexpr int CENTER = K / 2;
+
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    const int c0 = blockIdx.x * REDUCE_CTILE;
+    const int c0 = blockIdx.x * REDUCE_CTILE_;
     const int c = c0 + ty;
 
-    __shared__ acc_t s0[REDUCE_CTILE][REDUCE_THREADS];
-    __shared__ acc_t s1[REDUCE_CTILE][REDUCE_THREADS];
-    __shared__ acc_t s2[REDUCE_CTILE][REDUCE_THREADS];
-    __shared__ acc_t s3[REDUCE_CTILE][REDUCE_THREADS];
+    __shared__ acc_t shared[K][REDUCE_CTILE_][REDUCE_THREADS_];
+    acc_t acc[K];
 
-    acc_t acc0 = 0.0f;
-    acc_t acc1 = 0.0f;
-    acc_t acc2 = 0.0f;
-    acc_t acc3 = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+        acc[k] = 0.0f;
+    }
 
     const int BL = B * L;
-
-    for (int idx = tx; idx < BL; idx += REDUCE_THREADS) {
+    for (int idx = tx; idx < BL; idx += REDUCE_THREADS_) {
         if (c >= D) {
             break;
         }
@@ -147,38 +143,41 @@ __global__ void canon_bwd_dmix_kernel_k4(
         const int base = (b * L + t) * D + c;
         const acc_t go = static_cast<acc_t>(grad_out[base]);
 
-        if (t + 2 < L) acc0 += go * static_cast<acc_t>(x[(b * L + (t + 2)) * D + c]);
-        if (t + 1 < L) acc1 += go * static_cast<acc_t>(x[(b * L + (t + 1)) * D + c]);
-        acc2 += go * static_cast<acc_t>(x[base]);
-        if (t - 1 >= 0) acc3 += go * static_cast<acc_t>(x[(b * L + (t - 1)) * D + c]);
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const int src_t = t + CENTER - k;
+            if (src_t >= 0 && src_t < L) {
+                acc[k] += go * static_cast<acc_t>(x[(b * L + src_t) * D + c]);
+            }
+        }
     }
 
-    s0[ty][tx] = acc0;
-    s1[ty][tx] = acc1;
-    s2[ty][tx] = acc2;
-    s3[ty][tx] = acc3;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+        shared[k][ty][tx] = acc[k];
+    }
     __syncthreads();
 
-    for (int stride = REDUCE_THREADS / 2; stride > 0; stride >>= 1) {
+    for (int stride = REDUCE_THREADS_ / 2; stride > 0; stride >>= 1) {
         if (tx < stride) {
-            s0[ty][tx] += s0[ty][tx + stride];
-            s1[ty][tx] += s1[ty][tx + stride];
-            s2[ty][tx] += s2[ty][tx + stride];
-            s3[ty][tx] += s3[ty][tx + stride];
+            #pragma unroll
+            for (int k = 0; k < K; ++k) {
+                shared[k][ty][tx] += shared[k][ty][tx + stride];
+            }
         }
         __syncthreads();
     }
 
     if (tx == 0 && c < D) {
-        grad_mix[0 * D + c] = static_cast<scalar_t>(s0[ty][0]);
-        grad_mix[1 * D + c] = static_cast<scalar_t>(s1[ty][0]);
-        grad_mix[2 * D + c] = static_cast<scalar_t>(s2[ty][0]);
-        grad_mix[3 * D + c] = static_cast<scalar_t>(s3[ty][0]);
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            grad_mix[k * D + c] = static_cast<scalar_t>(shared[k][ty][0]);
+        }
     }
 }
 
 template <typename scalar_t>
-__global__ void canon_fwd_kernel(
+__global__ void canon_fwd_generic_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ mix,
     scalar_t* __restrict__ y,
@@ -210,7 +209,7 @@ __global__ void canon_fwd_kernel(
 }
 
 template <typename scalar_t>
-__global__ void canon_bwd_dx_kernel(
+__global__ void canon_bwd_dx_generic_kernel(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ mix,
     scalar_t* __restrict__ grad_x,
@@ -242,7 +241,7 @@ __global__ void canon_bwd_dx_kernel(
 }
 
 template <typename scalar_t>
-__global__ void canon_bwd_dmix_kernel(
+__global__ void canon_bwd_dmix_generic_kernel(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x,
     scalar_t* __restrict__ grad_mix,
@@ -302,13 +301,35 @@ torch::Tensor canon_forward_cuda(torch::Tensor x, torch::Tensor mix) {
     auto y = torch::empty_like(x);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "canon_forward_cuda", [&] {
-        if (K == 4) {
+        if (K == 2) {
+            dim3 block(K2_TILE_L, K2_CTILE);
+            dim3 grid((L + K2_TILE_L - 1) / K2_TILE_L,
+                      (D + K2_CTILE - 1) / K2_CTILE,
+                      B);
+
+            canon_fwd_smallk_kernel<2, K2_TILE_L, K2_CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+                x.data_ptr<scalar_t>(),
+                mix.data_ptr<scalar_t>(),
+                y.data_ptr<scalar_t>(),
+                B, L, D);
+        } else if (K == 3) {
             dim3 block(TILE_L, CTILE);
             dim3 grid((L + TILE_L - 1) / TILE_L,
                       (D + CTILE - 1) / CTILE,
                       B);
 
-            canon_fwd_kernel_k4<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_fwd_smallk_kernel<3, TILE_L, CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+                x.data_ptr<scalar_t>(),
+                mix.data_ptr<scalar_t>(),
+                y.data_ptr<scalar_t>(),
+                B, L, D);
+        } else if (K == 4) {
+            dim3 block(TILE_L, CTILE);
+            dim3 grid((L + TILE_L - 1) / TILE_L,
+                      (D + CTILE - 1) / CTILE,
+                      B);
+
+            canon_fwd_smallk_kernel<4, TILE_L, CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
                 x.data_ptr<scalar_t>(),
                 mix.data_ptr<scalar_t>(),
                 y.data_ptr<scalar_t>(),
@@ -318,7 +339,7 @@ torch::Tensor canon_forward_cuda(torch::Tensor x, torch::Tensor mix) {
             dim3 block(THREADS);
             dim3 grid((total + THREADS - 1) / THREADS);
 
-            canon_fwd_kernel<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_fwd_generic_kernel<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
                 x.data_ptr<scalar_t>(),
                 mix.data_ptr<scalar_t>(),
                 y.data_ptr<scalar_t>(),
@@ -348,13 +369,35 @@ std::vector<torch::Tensor> canon_backward_cuda(torch::Tensor grad_out, torch::Te
     auto grad_mix = torch::zeros({K, D}, x.options());
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "canon_backward_cuda", [&] {
-        if (K == 4) {
+        if (K == 2) {
+            dim3 block(K2_TILE_L, K2_CTILE);
+            dim3 grid((L + K2_TILE_L - 1) / K2_TILE_L,
+                      (D + K2_CTILE - 1) / K2_CTILE,
+                      B);
+
+            canon_bwd_dx_smallk_kernel<2, K2_TILE_L, K2_CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+                grad_out.data_ptr<scalar_t>(),
+                mix.data_ptr<scalar_t>(),
+                grad_x.data_ptr<scalar_t>(),
+                B, L, D);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            dim3 block_reduce(K2_REDUCE_THREADS, K2_REDUCE_CTILE);
+            dim3 grid_reduce((D + K2_REDUCE_CTILE - 1) / K2_REDUCE_CTILE);
+
+            canon_bwd_dmix_smallk_kernel<2, K2_REDUCE_THREADS, K2_REDUCE_CTILE, scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+                grad_out.data_ptr<scalar_t>(),
+                x.data_ptr<scalar_t>(),
+                grad_mix.data_ptr<scalar_t>(),
+                B, L, D);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else if (K == 3) {
             dim3 block(TILE_L, CTILE);
             dim3 grid((L + TILE_L - 1) / TILE_L,
                       (D + CTILE - 1) / CTILE,
                       B);
 
-            canon_bwd_dx_kernel_k4<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_bwd_dx_smallk_kernel<3, TILE_L, CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
                 grad_out.data_ptr<scalar_t>(),
                 mix.data_ptr<scalar_t>(),
                 grad_x.data_ptr<scalar_t>(),
@@ -364,7 +407,29 @@ std::vector<torch::Tensor> canon_backward_cuda(torch::Tensor grad_out, torch::Te
             dim3 block_reduce(REDUCE_THREADS, REDUCE_CTILE);
             dim3 grid_reduce((D + REDUCE_CTILE - 1) / REDUCE_CTILE);
 
-            canon_bwd_dmix_kernel_k4<scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_bwd_dmix_smallk_kernel<3, REDUCE_THREADS, REDUCE_CTILE, scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+                grad_out.data_ptr<scalar_t>(),
+                x.data_ptr<scalar_t>(),
+                grad_mix.data_ptr<scalar_t>(),
+                B, L, D);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else if (K == 4) {
+            dim3 block(TILE_L, CTILE);
+            dim3 grid((L + TILE_L - 1) / TILE_L,
+                      (D + CTILE - 1) / CTILE,
+                      B);
+
+            canon_bwd_dx_smallk_kernel<4, TILE_L, CTILE, scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+                grad_out.data_ptr<scalar_t>(),
+                mix.data_ptr<scalar_t>(),
+                grad_x.data_ptr<scalar_t>(),
+                B, L, D);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            dim3 block_reduce(REDUCE_THREADS, REDUCE_CTILE);
+            dim3 grid_reduce((D + REDUCE_CTILE - 1) / REDUCE_CTILE);
+
+            canon_bwd_dmix_smallk_kernel<4, REDUCE_THREADS, REDUCE_CTILE, scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
                 grad_out.data_ptr<scalar_t>(),
                 x.data_ptr<scalar_t>(),
                 grad_mix.data_ptr<scalar_t>(),
@@ -375,7 +440,7 @@ std::vector<torch::Tensor> canon_backward_cuda(torch::Tensor grad_out, torch::Te
             dim3 block(THREADS);
             dim3 grid((total + THREADS - 1) / THREADS);
 
-            canon_bwd_dx_kernel<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_bwd_dx_generic_kernel<scalar_t><<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
                 grad_out.data_ptr<scalar_t>(),
                 mix.data_ptr<scalar_t>(),
                 grad_x.data_ptr<scalar_t>(),
@@ -385,7 +450,7 @@ std::vector<torch::Tensor> canon_backward_cuda(torch::Tensor grad_out, torch::Te
             dim3 block_reduce(THREADS);
             dim3 grid_reduce((D + THREADS - 1) / THREADS, K);
 
-            canon_bwd_dmix_kernel<scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+            canon_bwd_dmix_generic_kernel<scalar_t><<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
                 grad_out.data_ptr<scalar_t>(),
                 x.data_ptr<scalar_t>(),
                 grad_mix.data_ptr<scalar_t>(),

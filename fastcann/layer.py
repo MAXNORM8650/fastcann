@@ -5,28 +5,57 @@ from torch import Tensor
 from . import _C
 
 
-class CanonFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, mix: Tensor):
-        valid_dtypes = {torch.float32, torch.float16, torch.bfloat16}
-        if x.dtype not in valid_dtypes:
-            raise TypeError(f"x must be float32, float16, or bfloat16, got {x.dtype}")
-        if mix.dtype not in valid_dtypes:
-            raise TypeError(f"mix must be float32, float16, or bfloat16, got {mix.dtype}")
-        if x.dtype != mix.dtype:
-            raise TypeError(f"x and mix must have the same dtype, got {x.dtype} and {mix.dtype}")
-        x = x.contiguous()
-        mix = mix.contiguous()
-        y = _C.forward(x, mix)
-        ctx.save_for_backward(x, mix)
-        return y
+def _check_inputs(x: Tensor, mix: Tensor) -> None:
+    valid_dtypes = {torch.float32, torch.float16, torch.bfloat16}
+    if x.dtype not in valid_dtypes:
+        raise TypeError(f"x must be float32, float16, or bfloat16, got {x.dtype}")
+    if mix.dtype not in valid_dtypes:
+        raise TypeError(f"mix must be float32, float16, or bfloat16, got {mix.dtype}")
+    if x.dtype != mix.dtype:
+        raise TypeError(f"x and mix must have the same dtype, got {x.dtype} and {mix.dtype}")
 
+
+@torch.library.custom_op("fastcann::forward", mutates_args=(), device_types="cuda")
+def canon_forward_op(x: Tensor, mix: Tensor) -> Tensor:
+    _check_inputs(x, mix)
+    return _C.forward(x.contiguous(), mix.contiguous())
+
+
+@torch.library.custom_op("fastcann::backward", mutates_args=(), device_types="cuda")
+def canon_backward_op(grad_out: Tensor, x: Tensor, mix: Tensor) -> tuple[Tensor, Tensor]:
+    _check_inputs(x, mix)
+    if grad_out.dtype != x.dtype:
+        raise TypeError(f"grad_out and x must have the same dtype, got {grad_out.dtype} and {x.dtype}")
+    return _C.backward(grad_out.contiguous(), x.contiguous(), mix.contiguous())
+
+
+@torch.library.register_fake("fastcann::forward")
+def _(x: Tensor, mix: Tensor) -> Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.register_fake("fastcann::backward")
+def _(grad_out: Tensor, x: Tensor, mix: Tensor) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(x), torch.empty_like(mix)
+
+
+def _setup_context(ctx, inputs, output) -> None:
+    x, mix = inputs
+    ctx.save_for_backward(x, mix)
+
+
+def _backward(ctx, grad_out: Tensor) -> tuple[Tensor, Tensor]:
+    x, mix = ctx.saved_tensors
+    return canon_backward_op(grad_out, x, mix)
+
+
+torch.library.register_autograd("fastcann::forward", _backward, setup_context=_setup_context)
+
+
+class CanonFn:
     @staticmethod
-    def backward(ctx, grad_out: Tensor):
-        x, mix = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
-        grad_x, grad_mix = _C.backward(grad_out, x, mix)
-        return grad_x, grad_mix
+    def apply(x: Tensor, mix: Tensor) -> Tensor:
+        return canon_forward_op(x, mix)
 
 
 class CanonLayerCUDA(nn.Module):
@@ -48,4 +77,4 @@ class CanonLayerCUDA(nn.Module):
             raise ValueError(f"x must have shape [B, L, D], got {tuple(x.shape)}")
         if x.shape[-1] != self.dim:
             raise ValueError(f"Expected last dim {self.dim}, got {x.shape[-1]}")
-        return CanonFn.apply(x, self.mix)
+        return canon_forward_op(x, self.mix)
