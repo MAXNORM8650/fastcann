@@ -23,7 +23,7 @@ Out-of-range sequence positions are treated as zero.
 From GitHub release/tag:
 
 ```bash
-pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.1
+pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.2
 ```
 
 Once the package is published to PyPI, the install command will be:
@@ -76,6 +76,8 @@ This package builds a Torch extension during installation, so the target environ
 - compiler/build tools
 - `setuptools`
 
+On ROCm, `fastcann` filters unsupported GPU targets before invoking `hipcc`. This avoids build failures caused by invalid default targets such as `gfx950` on toolchains that do not support them.
+
 Legacy import paths are still supported:
 
 ```python
@@ -106,6 +108,12 @@ Reference test:
 
 ```bash
 python test_canon_cuda.py
+```
+
+If you want to install into a specific interpreter with `uv`, this is the pattern used during validation:
+
+```bash
+uv pip install --python "/path/to/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.2
 ```
 
 ## Current Limits

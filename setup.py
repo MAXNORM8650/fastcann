@@ -76,19 +76,55 @@ def _sanitize_rocm_arch_env():
             )
 
 
+def _resolve_rocm_arches(torch_module):
+    requested_arches = []
+
+    for env_var in ROCM_ARCH_ENV_VARS:
+        raw_value = os.environ.get(env_var)
+        if raw_value:
+            requested_arches.extend(_split_rocm_arches(raw_value))
+
+    if not requested_arches:
+        arch_flags = torch_module._C._cuda_getArchFlags()
+        if arch_flags:
+            requested_arches.extend(
+                flag.split("=", 1)[1]
+                for flag in arch_flags.split()
+                if flag.startswith("--offload-arch=")
+            )
+
+    if not requested_arches:
+        return []
+
+    supported_arches = []
+    dropped_arches = []
+    for arch in requested_arches:
+        if arch in supported_arches or arch in dropped_arches:
+            continue
+        if _hipcc_supports_arch(arch):
+            supported_arches.append(arch)
+        else:
+            dropped_arches.append(arch)
+
+    if dropped_arches:
+        print("fastcann: dropping unsupported ROCm archs: " + ", ".join(dropped_arches))
+
+    return supported_arches
+
+
 def get_extension_modules():
     import torch
     from torch.utils.cpp_extension import CUDAExtension
 
     is_rocm = getattr(torch.version, "hip", None) is not None
 
-    if is_rocm:
-        _sanitize_rocm_arch_env()
-
     cxx_flags = ["-O3", "-std=c++17"]
     device_flags = ["-O3", "-std=c++17"]
 
     if is_rocm:
+        _sanitize_rocm_arch_env()
+        rocm_arches = _resolve_rocm_arches(torch)
+        device_flags += [f"--offload-arch={arch}" for arch in rocm_arches]
         device_flags += ["-fno-gpu-rdc"]
     else:
         device_flags += ["--use_fast_math"]
