@@ -20,13 +20,19 @@ Out-of-range sequence positions are treated as zero.
 
 ## Install
 
-Standard install:
+From GitHub release/tag:
 
 ```bash
-pip install .
+pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.1
 ```
 
-Editable install for development:
+Once the package is published to PyPI, the install command will be:
+
+```bash
+pip install fastcann
+```
+
+For local development from this repo:
 
 ```bash
 pip install -e . --no-build-isolation
@@ -38,7 +44,7 @@ Manual in-place extension build:
 python setup.py build_ext --inplace
 ```
 
-If you are building inside a managed environment in this repo, the working command used here was:
+The environment used during development here was:
 
 ```bash
 uv run --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" python setup.py build_ext --inplace
@@ -62,6 +68,13 @@ layer = CanonLayerCUDA(dim=768, kernel_size=4).cuda()
 x = torch.randn(8, 2048, 768, device="cuda", dtype=torch.float32)
 y = layer(x)
 ```
+
+This package builds a Torch extension during installation, so the target environment must already have:
+
+- `torch`
+- a working CUDA or ROCm toolchain
+- compiler/build tools
+- `setuptools`
 
 Legacy import paths are still supported:
 

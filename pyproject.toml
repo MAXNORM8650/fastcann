@@ -1,0 +1,40 @@
+[build-system]
+requires = [
+    "setuptools>=70",
+    "wheel",
+    "torch",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastcann"
+version = "0.1.0"
+description = "Fast GPU-backed Canon layers for PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+authors = [
+    { name = "MAXNORM8650" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Source = "https://github.com/MAXNORM8650/fastcann"
+Releases = "https://github.com/MAXNORM8650/fastcann/releases"
+Issues = "https://github.com/MAXNORM8650/fastcann/issues"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["canon"]
