@@ -26,6 +26,17 @@ From GitHub release/tag:
 pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.2
 ```
 
+On this ROCm environment, the install that worked was:
+
+```bash
+PYTORCH_ROCM_ARCH=gfx90a uv pip install --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.4
+```
+
+That installed:
+
+- `fastcann==0.1.0`
+- built from commit `bb0ac36eb3847c7e15bbc3cd9cc43ffb86ba580c`
+
 Once the package is published to PyPI, the install command will be:
 
 ```bash
@@ -76,7 +87,7 @@ This package builds a Torch extension during installation, so the target environ
 - compiler/build tools
 - `setuptools`
 
-On ROCm, `fastcann` filters unsupported GPU targets before invoking `hipcc`. This avoids build failures caused by invalid default targets such as `gfx950` on toolchains that do not support them.
+On ROCm, if the build still picks up unsupported default GPU targets such as `gfx950`, set `PYTORCH_ROCM_ARCH` explicitly during install. On this machine, forcing `PYTORCH_ROCM_ARCH=gfx90a` avoided the unsupported target failure.
 
 Legacy import paths are still supported:
 
@@ -113,7 +124,7 @@ python test_canon_cuda.py
 If you want to install into a specific interpreter with `uv`, this is the pattern used during validation:
 
 ```bash
-uv pip install --python "/path/to/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.2
+PYTORCH_ROCM_ARCH=gfx90a uv pip install --python "/path/to/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.4
 ```
 
 ## Current Limits
