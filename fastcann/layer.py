@@ -27,12 +27,12 @@ class CanonFn(torch.autograd.Function):
 
 
 class CanonLayerCUDA(nn.Module):
-    """CUDA implementation of CanonLayer for kernel_size=4 and float32 CUDA tensors."""
+    """GPU implementation of CanonLayer for float32 CUDA/ROCm tensors."""
 
     def __init__(self, dim: int, kernel_size: int = 4):
         super().__init__()
-        if kernel_size != 4:
-            raise ValueError("This CUDA starter currently supports kernel_size=4 only.")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size must be positive.")
         self.dim = dim
         self.kernel_size = kernel_size
         self.mix = nn.Parameter(torch.empty(kernel_size, dim, dtype=torch.float32))

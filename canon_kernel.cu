@@ -10,12 +10,13 @@
 
 namespace {
 
+constexpr int THREADS = 256;
 constexpr int TILE_L = 64;
 constexpr int CTILE = 4;
 constexpr int REDUCE_THREADS = 256;
 constexpr int REDUCE_CTILE = 4;
 
-__global__ void canon_fwd_fp32_kernel(
+__global__ void canon_fwd_fp32_kernel_k4(
     const float* __restrict__ x,
     const float* __restrict__ mix,
     float* __restrict__ y,
@@ -51,16 +52,15 @@ __global__ void canon_fwd_fp32_kernel(
         const float w3 = mix[3 * D + c];
 
         const float xm1 = smem[ty][tx + 0];
-        const float x0  = smem[ty][tx + 1];
+        const float x0 = smem[ty][tx + 1];
         const float xp1 = smem[ty][tx + 2];
         const float xp2 = smem[ty][tx + 3];
 
-        const float out = x0 + w0 * xp2 + w1 * xp1 + w2 * x0 + w3 * xm1;
-        y[(b * L + t) * D + c] = out;
+        y[(b * L + t) * D + c] = x0 + w0 * xp2 + w1 * xp1 + w2 * x0 + w3 * xm1;
     }
 }
 
-__global__ void canon_bwd_dx_fp32_kernel(
+__global__ void canon_bwd_dx_fp32_kernel_k4(
     const float* __restrict__ grad_out,
     const float* __restrict__ mix,
     float* __restrict__ grad_x,
@@ -97,15 +97,14 @@ __global__ void canon_bwd_dx_fp32_kernel(
 
         const float gm2 = smem[ty][tx + 0];
         const float gm1 = smem[ty][tx + 1];
-        const float g0  = smem[ty][tx + 2];
+        const float g0 = smem[ty][tx + 2];
         const float gp1 = smem[ty][tx + 3];
 
-        const float out = g0 + w0 * gm2 + w1 * gm1 + w2 * g0 + w3 * gp1;
-        grad_x[(b * L + t) * D + c] = out;
+        grad_x[(b * L + t) * D + c] = g0 + w0 * gm2 + w1 * gm1 + w2 * g0 + w3 * gp1;
     }
 }
 
-__global__ void canon_bwd_dmix_fp32_kernel(
+__global__ void canon_bwd_dmix_fp32_kernel_k4(
     const float* __restrict__ grad_out,
     const float* __restrict__ x,
     float* __restrict__ grad_mix,
@@ -168,6 +167,97 @@ __global__ void canon_bwd_dmix_fp32_kernel(
     }
 }
 
+__global__ void canon_fwd_fp32_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ mix,
+    float* __restrict__ y,
+    int B,
+    int L,
+    int D,
+    int K,
+    int center) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * L * D;
+    if (idx >= total) {
+        return;
+    }
+
+    const int c = idx % D;
+    const int t = (idx / D) % L;
+    const int b = idx / (L * D);
+
+    float out = x[idx];
+    for (int k = 0; k < K; ++k) {
+        const int src_t = t + center - k;
+        if (src_t >= 0 && src_t < L) {
+            out += mix[k * D + c] * x[(b * L + src_t) * D + c];
+        }
+    }
+
+    y[idx] = out;
+}
+
+__global__ void canon_bwd_dx_fp32_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ mix,
+    float* __restrict__ grad_x,
+    int B,
+    int L,
+    int D,
+    int K,
+    int center) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * L * D;
+    if (idx >= total) {
+        return;
+    }
+
+    const int c = idx % D;
+    const int t = (idx / D) % L;
+    const int b = idx / (L * D);
+
+    float out = grad_out[idx];
+    for (int k = 0; k < K; ++k) {
+        const int grad_t = t - center + k;
+        if (grad_t >= 0 && grad_t < L) {
+            out += mix[k * D + c] * grad_out[(b * L + grad_t) * D + c];
+        }
+    }
+
+    grad_x[idx] = out;
+}
+
+__global__ void canon_bwd_dmix_fp32_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ x,
+    float* __restrict__ grad_mix,
+    int B,
+    int L,
+    int D,
+    int K,
+    int center) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y;
+    if (c >= D || k >= K) {
+        return;
+    }
+
+    float acc = 0.0f;
+    const int BL = B * L;
+    for (int idx = 0; idx < BL; ++idx) {
+        const int b = idx / L;
+        const int t = idx - b * L;
+        const int src_t = t + center - k;
+        if (src_t >= 0 && src_t < L) {
+            const int grad_base = (b * L + t) * D + c;
+            const int x_base = (b * L + src_t) * D + c;
+            acc += grad_out[grad_base] * x[x_base];
+        }
+    }
+
+    grad_mix[k * D + c] = acc;
+}
+
 void check_inputs(torch::Tensor x, torch::Tensor mix) {
     CHECK_CUDA(x);
     CHECK_CUDA(mix);
@@ -176,8 +266,8 @@ void check_inputs(torch::Tensor x, torch::Tensor mix) {
     CHECK_FLOAT(x);
     CHECK_FLOAT(mix);
     TORCH_CHECK(x.dim() == 3, "x must be [B, L, D]");
-    TORCH_CHECK(mix.dim() == 2, "mix must be [4, D]");
-    TORCH_CHECK(mix.size(0) == 4, "mix must have shape [4, D]");
+    TORCH_CHECK(mix.dim() == 2, "mix must be [K, D]");
+    TORCH_CHECK(mix.size(0) > 0, "mix must have shape [K, D] with K > 0");
     TORCH_CHECK(x.size(2) == mix.size(1), "D mismatch between x and mix");
 }
 
@@ -189,19 +279,33 @@ torch::Tensor canon_forward_cuda(torch::Tensor x, torch::Tensor mix) {
     const int B = x.size(0);
     const int L = x.size(1);
     const int D = x.size(2);
+    const int K = mix.size(0);
+    const int center = K / 2;
 
     auto y = torch::empty_like(x);
 
-    dim3 block(TILE_L, CTILE);
-    dim3 grid((L + TILE_L - 1) / TILE_L,
-              (D + CTILE - 1) / CTILE,
-              B);
+    if (K == 4) {
+        dim3 block(TILE_L, CTILE);
+        dim3 grid((L + TILE_L - 1) / TILE_L,
+                  (D + CTILE - 1) / CTILE,
+                  B);
 
-    canon_fwd_fp32_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
-        x.data_ptr<float>(),
-        mix.data_ptr<float>(),
-        y.data_ptr<float>(),
-        B, L, D);
+        canon_fwd_fp32_kernel_k4<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            x.data_ptr<float>(),
+            mix.data_ptr<float>(),
+            y.data_ptr<float>(),
+            B, L, D);
+    } else {
+        const int total = B * L * D;
+        dim3 block(THREADS);
+        dim3 grid((total + THREADS - 1) / THREADS);
+
+        canon_fwd_fp32_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            x.data_ptr<float>(),
+            mix.data_ptr<float>(),
+            y.data_ptr<float>(),
+            B, L, D, K, center);
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
@@ -218,31 +322,56 @@ std::vector<torch::Tensor> canon_backward_cuda(torch::Tensor grad_out, torch::Te
     const int B = x.size(0);
     const int L = x.size(1);
     const int D = x.size(2);
+    const int K = mix.size(0);
+    const int center = K / 2;
 
     auto grad_x = torch::empty_like(x);
-    auto grad_mix = torch::zeros({4, D}, x.options());
+    auto grad_mix = torch::zeros({K, D}, x.options());
 
-    dim3 block(TILE_L, CTILE);
-    dim3 grid((L + TILE_L - 1) / TILE_L,
-              (D + CTILE - 1) / CTILE,
-              B);
+    if (K == 4) {
+        dim3 block(TILE_L, CTILE);
+        dim3 grid((L + TILE_L - 1) / TILE_L,
+                  (D + CTILE - 1) / CTILE,
+                  B);
 
-    canon_bwd_dx_fp32_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
-        grad_out.data_ptr<float>(),
-        mix.data_ptr<float>(),
-        grad_x.data_ptr<float>(),
-        B, L, D);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        canon_bwd_dx_fp32_kernel_k4<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            grad_out.data_ptr<float>(),
+            mix.data_ptr<float>(),
+            grad_x.data_ptr<float>(),
+            B, L, D);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    dim3 block_reduce(REDUCE_THREADS, REDUCE_CTILE);
-    dim3 grid_reduce((D + REDUCE_CTILE - 1) / REDUCE_CTILE);
+        dim3 block_reduce(REDUCE_THREADS, REDUCE_CTILE);
+        dim3 grid_reduce((D + REDUCE_CTILE - 1) / REDUCE_CTILE);
 
-    canon_bwd_dmix_fp32_kernel<<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
-        grad_out.data_ptr<float>(),
-        x.data_ptr<float>(),
-        grad_mix.data_ptr<float>(),
-        B, L, D);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        canon_bwd_dmix_fp32_kernel_k4<<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+            grad_out.data_ptr<float>(),
+            x.data_ptr<float>(),
+            grad_mix.data_ptr<float>(),
+            B, L, D);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        const int total = B * L * D;
+        dim3 block(THREADS);
+        dim3 grid((total + THREADS - 1) / THREADS);
+
+        canon_bwd_dx_fp32_kernel<<<grid, block, 0, at::cuda::getDefaultCUDAStream()>>>(
+            grad_out.data_ptr<float>(),
+            mix.data_ptr<float>(),
+            grad_x.data_ptr<float>(),
+            B, L, D, K, center);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        dim3 block_reduce(THREADS);
+        dim3 grid_reduce((D + THREADS - 1) / THREADS, K);
+
+        canon_bwd_dmix_fp32_kernel<<<grid_reduce, block_reduce, 0, at::cuda::getDefaultCUDAStream()>>>(
+            grad_out.data_ptr<float>(),
+            x.data_ptr<float>(),
+            grad_mix.data_ptr<float>(),
+            B, L, D, K, center);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     return {grad_x, grad_mix};
 }
