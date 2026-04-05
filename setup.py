@@ -124,6 +124,10 @@ def get_extension_modules():
     if is_rocm:
         _sanitize_rocm_arch_env()
         rocm_arches = _resolve_rocm_arches(torch)
+        if rocm_arches:
+            # Force PyTorch's HIP build path to use the same sanitized list
+            # instead of falling back to torch._C._cuda_getArchFlags().
+            os.environ["PYTORCH_ROCM_ARCH"] = ";".join(rocm_arches)
         device_flags += [f"--offload-arch={arch}" for arch in rocm_arches]
         device_flags += ["-fno-gpu-rdc"]
     else:
