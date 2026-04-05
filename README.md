@@ -1,8 +1,10 @@
 # fastcann
 
-This project packages a custom PyTorch CUDA extension for fast `CanonLayer` local mixing with `kernel_size=4` and `float32` CUDA tensors.
+`fastcann` is a PyTorch extension package for a fast GPU implementation of the Canon local mixing layer with `kernel_size=4`.
 
-## Operator
+It currently targets `float32` tensors on GPU and provides a small Python API on top of a compiled C++/CUDA-or-ROCm extension.
+
+## What It Computes
 
 For each batch `b`, token `t`, and channel `c`:
 
@@ -14,71 +16,97 @@ y[b, t, c] = x[b, t, c]
            + mix[3, c] * x[b, t - 1, c]
 ```
 
-Values outside the sequence bounds are treated as zero.
-
-## Package layout
-
-- `setup.py` - package build script
-- `fastcann/` - installable Python package
-- `canon.cpp` - Python bindings
-- `canon_kernel.cu` - CUDA kernels and launchers
-- `fast_canon_layers/` - legacy compatibility package
-- `canon.py` - backward-compatible import shim
-- `test_canon_cuda.py` - correctness and speed test
+Out-of-range sequence positions are treated as zero.
 
 ## Install
 
-From this directory:
+Standard install:
 
 ```bash
 pip install .
 ```
 
-If you want an editable install during development:
+Editable install for development:
 
 ```bash
-pip install -e .
+pip install -e . --no-build-isolation
 ```
 
-You can still build the extension in place if needed:
+Manual in-place extension build:
 
 ```bash
 python setup.py build_ext --inplace
 ```
 
+If you are building inside a managed environment in this repo, the working command used here was:
+
+```bash
+uv run --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" python setup.py build_ext --inplace
+```
+
 ## Usage
+
+Primary import:
 
 ```python
 from fastcann import CanonLayerCUDA
 ```
 
-The previous import paths remain available:
+Example:
+
+```python
+import torch
+from fastcann import CanonLayerCUDA
+
+layer = CanonLayerCUDA(dim=768, kernel_size=4).cuda()
+x = torch.randn(8, 2048, 768, device="cuda", dtype=torch.float32)
+y = layer(x)
+```
+
+Legacy import paths are still supported:
 
 ```python
 from fast_canon_layers import CanonLayerCUDA
 from canon import CanonLayerCUDA
 ```
 
-## Test
+## Project Layout
+
+- `fastcann/` - primary installable package
+- `fast_canon_layers/` - compatibility package
+- `canon.py` - compatibility shim
+- `canon.cpp` - Python bindings for the extension
+- `canon_kernel.cu` - GPU kernels and launcher code
+- `setup.py` - package build script
+- `simple_test.py` - quick correctness and speed check
+- `test_canon_cuda.py` - reference correctness and benchmark script
+
+## Testing
+
+Quick run:
+
+```bash
+uv run --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" python -u simple_test.py
+```
+
+Reference test:
 
 ```bash
 python test_canon_cuda.py
 ```
 
-## Current scope
+## Current Limits
 
-- CUDA only
+- GPU only
 - contiguous tensors only
 - `float32` only
 - `kernel_size=4` only
-- forward, `grad_x`, and `grad_mix` implemented in CUDA
+- forward, `grad_x`, and `grad_mix` implemented
 
-## Good next upgrades
+## Roadmap
 
 - add `half` and `bfloat16`
-- tune `TILE_L`, `CTILE`, `REDUCE_THREADS`, `REDUCE_CTILE`
-- replace block-wide shared-memory reduction with warp-level reduction in `grad_mix`
+- tune `TILE_L`, `CTILE`, `REDUCE_THREADS`, and `REDUCE_CTILE`
+- replace the shared-memory reduction in `grad_mix` with a warp-level reduction
 - vectorize loads when alignment allows
 - consider a two-stage reduction for very large `B * L`
-
-# fastcann
