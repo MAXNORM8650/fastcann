@@ -23,13 +23,13 @@ Out-of-range sequence positions are treated as zero.
 From GitHub release/tag:
 
 ```bash
-pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.2
+pip install --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.7
 ```
 
 On this ROCm environment, the install that worked was:
 
 ```bash
-PYTORCH_ROCM_ARCH=gfx90a uv pip install --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.4
+PYTORCH_ROCM_ARCH=gfx90a uv pip install --python "/vast/users/hisham.cholakkal/documents/multiagent/GPA/codegent-pkg/.venv/bin/python" --no-build-isolation git+https://github.com/MAXNORM8650/fastcann.git@v0.1.7
 ```
 
 That installed:
